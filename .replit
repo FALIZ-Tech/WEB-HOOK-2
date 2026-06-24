@@ -1,0 +1,7 @@
+run = "python app.py"
+language = "python3"
+onBoot = "pip install -r requirements.txt"
+
+[env]
+OPENAI_API_KEY = ""
+FLASK_ENV = "development"
