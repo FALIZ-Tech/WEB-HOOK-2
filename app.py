@@ -1,230 +1,376 @@
-from flask import Flask, render_template, request, jsonify, session
-from functools import wraps
-import uuid
+"""
+Main Flask Application - FALIZ Multilingual Chat Bot
+Integrates all modules with fallback support
+"""
+
+import os
 import json
 from datetime import datetime
-from config import Config, config as config_map
+from flask import Flask, render_template, request, jsonify
+from dotenv import load_dotenv
+
+from config import Config
 from database import Database
 from language_detector import LanguageDetector
+from prompt_engine import PromptEngine
 from llm_handler import LLMHandler
-import os
+from fallback_engine import generate_fallback_response
+
+# Load environment variables
+load_dotenv()
 
 # Initialize Flask app
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates')
+app.config.from_object(Config)
 
-# Load configuration
-env = os.getenv('FLASK_ENV', 'development')
-app.config.from_object(config_map[env])
-
-# Validate configuration
-try:
-    Config.validate_config()
-except ValueError as e:
-    print(f"Configuration Error: {e}")
-    print("Please set the OPENAI_API_KEY environment variable.")
-
-# Initialize database
-db = Database()
-
-# Initialize LLM handler
+# Initialize modules
+db = Database(app.config['DATABASE_PATH'])
+language_detector = LanguageDetector()
+prompt_engine = PromptEngine()
 llm_handler = LLMHandler()
 
-def get_or_create_user_id():
-    """Get or create user ID from session/cookies"""
-    if 'user_id' not in session:
-        user_id = str(uuid.uuid4())
-        session['user_id'] = user_id
-    return session['user_id']
+# Initialize database
+db.init_db()
 
-def require_user(f):
-    """Decorator to ensure user exists in database"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        user_id = get_or_create_user_id()
-        user = db.get_user(user_id)
-        
-        if not user:
-            db.create_user(user_id)
-        
-        return f(*args, **kwargs)
-    
-    return decorated_function
+
+@app.before_request
+def before_request():
+    """Set up request context"""
+    request.start_time = datetime.now()
+
+
+@app.after_request
+def after_request(response):
+    """Log request details"""
+    if hasattr(request, 'start_time'):
+        duration = (datetime.now() - request.start_time).total_seconds()
+        print(f"[{request.method}] {request.path} - {response.status_code} ({duration:.3f}s)")
+    return response
+
+
+# ==================== Web Routes ====================
 
 @app.route('/')
-@require_user
 def index():
     """Serve main chat interface"""
-    user_id = session['user_id']
-    user = db.get_user(user_id)
-    
-    return render_template('index.html', 
-                         user_id=user_id,
-                         language_preference=user.get('language_preference') if user else None)
-
-@app.route('/api/chat', methods=['POST'])
-@require_user
-def chat():
-    """Handle chat messages"""
-    user_id = session['user_id']
-    data = request.get_json()
-    
-    if not data or 'message' not in data:
-        return jsonify({'error': 'No message provided'}), 400
-    
-    user_message = data['message'].strip()
-    
-    if not user_message:
-        return jsonify({'error': 'Empty message'}), 400
-    
-    if len(user_message) > 5000:
-        return jsonify({'error': 'Message too long (max 5000 characters)'}), 400
-    
     try:
-        # Get or create user
-        user = db.get_user(user_id)
-        if not user:
-            db.create_user(user_id)
-            user = db.get_user(user_id)
-        
-        # Detect language from user message
-        detected_language = LanguageDetector.detect_language(user_message)
-        detected_languages = LanguageDetector.detect_mixed_languages(user_message)
-        
-        # Update user language preference if not set
-        if not user.get('language_preference'):
-            db.create_user(user_id, detected_language)
-        
-        # Get or create conversation
-        latest_conv = db.get_latest_conversation(user_id)
-        
-        if latest_conv:
-            conversation_id = latest_conv['conversation_id']
-        else:
-            conversation_id = db.create_conversation(user_id)
-        
-        # Store user message
-        db.store_message(conversation_id, user_id, 'user', user_message, detected_language)
-        
-        # Get conversation history (excluding the message we just stored)
-        history = db.get_conversation_history(conversation_id, limit=50)
-        
-        # Generate response from LLM
-        response_text, error_msg = llm_handler.generate_response(
-            user_message,
-            history,
-            detected_languages
-        )
-        
-        if error_msg:
-            return jsonify({
-                'error': error_msg,
-                'type': 'llm_error'
-            }), 500
-        
-        # Store assistant response
-        db.store_message(conversation_id, user_id, 'assistant', response_text, detected_language)
-        
-        return jsonify({
-            'response': response_text,
-            'detected_language': detected_language,
-            'language_name': LanguageDetector.get_language_name(detected_language),
-            'conversation_id': conversation_id,
-            'timestamp': datetime.utcnow().isoformat()
-        }), 200
-    
+        return render_template('index.html')
     except Exception as e:
-        print(f"Error in chat endpoint: {str(e)}")
-        return jsonify({
-            'error': 'An unexpected error occurred. Please try again.',
-            'type': 'server_error'
-        }), 500
+        print(f"Error loading template: {e}")
+        return jsonify({'error': 'Failed to load chat interface'}), 500
 
-@app.route('/api/conversation/<int:conversation_id>', methods=['GET'])
-@require_user
-def get_conversation(conversation_id):
-    """Get conversation history"""
-    try:
-        history = db.get_conversation_history(conversation_id)
-        return jsonify({'messages': history}), 200
-    except Exception as e:
-        print(f"Error retrieving conversation: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve conversation'}), 500
 
-@app.route('/api/conversations', methods=['GET'])
-@require_user
-def get_conversations():
-    """Get user's conversations"""
-    user_id = session['user_id']
-    try:
-        conversations = db.get_user_conversations(user_id, limit=20)
-        return jsonify({'conversations': conversations}), 200
-    except Exception as e:
-        print(f"Error retrieving conversations: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve conversations'}), 500
-
-@app.route('/api/new-conversation', methods=['POST'])
-@require_user
-def new_conversation():
-    """Create new conversation"""
-    user_id = session['user_id']
-    try:
-        conversation_id = db.create_conversation(user_id)
-        return jsonify({'conversation_id': conversation_id}), 201
-    except Exception as e:
-        print(f"Error creating conversation: {str(e)}")
-        return jsonify({'error': 'Failed to create conversation'}), 500
-
-@app.route('/api/delete-conversation/<int:conversation_id>', methods=['DELETE'])
-@require_user
-def delete_conversation(conversation_id):
-    """Delete a conversation"""
-    try:
-        db.delete_conversation(conversation_id)
-        return jsonify({'success': True}), 200
-    except Exception as e:
-        print(f"Error deleting conversation: {str(e)}")
-        return jsonify({'error': 'Failed to delete conversation'}), 500
-
-@app.route('/api/user-info', methods=['GET'])
-@require_user
-def user_info():
-    """Get user information"""
-    user_id = session['user_id']
-    try:
-        user = db.get_user(user_id)
-        return jsonify({
-            'user_id': user_id,
-            'language_preference': user.get('language_preference') if user else None
-        }), 200
-    except Exception as e:
-        print(f"Error retrieving user info: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve user info'}), 500
-
-@app.route('/api/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'llm_configured': LLMHandler.is_configured()
-    }), 200
+        'timestamp': datetime.now().isoformat(),
+        'api_available': llm_handler.is_api_available()
+    })
+
+
+# ==================== API Routes ====================
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """
+    Main chat endpoint
+    Accepts message and conversation_id, returns response with language detection
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or 'message' not in data:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        user_message = data.get('message', '').strip()
+        conversation_id = data.get('conversation_id')
+        
+        if not user_message:
+            return jsonify({'error': 'Message cannot be empty'}), 400
+        
+        if not conversation_id:
+            return jsonify({'error': 'Conversation ID is required'}), 400
+        
+        # Detect language
+        detected_language = language_detector.detect(user_message)
+        print(f"Detected language: {detected_language}")
+        
+        # Store user message in database
+        db.add_message(conversation_id, 'user', user_message, detected_language)
+        
+        # Get conversation history
+        conversation_history = db.get_conversation_messages(conversation_id)
+        
+        # Get system prompt with language-specific template
+        system_prompt = prompt_engine.get_system_prompt(detected_language)
+        
+        # Prepare messages for LLM
+        messages_for_llm = []
+        
+        # Add system prompt
+        messages_for_llm.append({
+            'role': 'system',
+            'content': system_prompt
+        })
+        
+        # Add conversation history
+        for msg in conversation_history:
+            messages_for_llm.append({
+                'role': msg['role'],
+                'content': msg['content']
+            })
+        
+        # Get response from LLM
+        try:
+            response_text = llm_handler.get_response(messages_for_llm, detected_language)
+            is_fallback = False
+        except Exception as llm_error:
+            print(f"LLM Error: {llm_error}")
+            print("Falling back to offline mode...")
+            
+            # Use fallback response
+            response_text = generate_fallback_response(
+                user_message,
+                detected_language,
+                conversation_history
+            )
+            is_fallback = True
+        
+        # Store bot response in database
+        db.add_message(conversation_id, 'assistant', response_text, detected_language)
+        
+        # Return response
+        return jsonify({
+            'response': response_text,
+            'detected_language': detected_language,
+            'conversation_id': conversation_id,
+            'is_fallback': is_fallback,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+    
+    except Exception as e:
+        print(f"Error in /api/chat: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/new-conversation', methods=['POST'])
+def new_conversation():
+    """Create a new conversation"""
+    try:
+        conversation_id = db.create_conversation()
+        return jsonify({
+            'conversation_id': conversation_id,
+            'created_at': datetime.now().isoformat()
+        }), 201
+    except Exception as e:
+        print(f"Error creating conversation: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversations', methods=['GET'])
+def get_conversations():
+    """Get all conversations"""
+    try:
+        conversations = db.get_conversations()
+        return jsonify({'conversations': conversations}), 200
+    except Exception as e:
+        print(f"Error fetching conversations: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/conversation/<int:conversation_id>', methods=['GET'])
+def get_conversation(conversation_id):
+    """Get specific conversation with all messages"""
+    try:
+        messages = db.get_conversation_messages(conversation_id)
+        
+        if not messages:
+            return jsonify({
+                'conversation_id': conversation_id,
+                'messages': [],
+                'message': 'No messages found for this conversation'
+            }), 200
+        
+        return jsonify({
+            'conversation_id': conversation_id,
+            'messages': messages,
+            'message_count': len(messages)
+        }), 200
+    except Exception as e:
+        print(f"Error fetching conversation: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/delete-conversation/<int:conversation_id>', methods=['DELETE'])
+def delete_conversation(conversation_id):
+    """Delete a conversation and all its messages"""
+    try:
+        db.delete_conversation(conversation_id)
+        return jsonify({
+            'message': 'Conversation deleted successfully',
+            'conversation_id': conversation_id
+        }), 200
+    except Exception as e:
+        print(f"Error deleting conversation: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/statistics', methods=['GET'])
+def get_statistics():
+    """Get chat statistics"""
+    try:
+        stats = db.get_statistics()
+        return jsonify(stats), 200
+    except Exception as e:
+        print(f"Error fetching statistics: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/language-detect', methods=['POST'])
+def detect_language():
+    """Standalone language detection endpoint"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'text' not in data:
+            return jsonify({'error': 'Text is required'}), 400
+        
+        text = data.get('text', '').strip()
+        
+        if not text:
+            return jsonify({'error': 'Text cannot be empty'}), 400
+        
+        detected_language = language_detector.detect(text)
+        confidence = language_detector.detect_confidence(text)
+        
+        return jsonify({
+            'text': text,
+            'detected_language': detected_language,
+            'confidence': confidence
+        }), 200
+    except Exception as e:
+        print(f"Error detecting language: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ==================== Error Handlers ====================
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'error': 'Not found'}), 404
+    """Handle 404 errors"""
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    """Handle 405 errors"""
+    return jsonify({'error': 'Method not allowed'}), 405
+
 
 @app.errorhandler(500)
-def server_error(error):
+def internal_error(error):
+    """Handle 500 errors"""
     return jsonify({'error': 'Internal server error'}), 500
 
-@app.before_request
-def before_request():
-    """Ensure session is secure"""
-    if not app.debug:
-        session.permanent = True
+
+# ==================== CLI Commands ====================
+
+@app.cli.command()
+def reset_db():
+    """Reset the database"""
+    try:
+        db.reset_db()
+        print("✅ Database reset successfully!")
+    except Exception as e:
+        print(f"❌ Error resetting database: {e}")
+
+
+@app.cli.command()
+def init_db_cmd():
+    """Initialize the database"""
+    try:
+        db.init_db()
+        print("✅ Database initialized successfully!")
+    except Exception as e:
+        print(f"❌ Error initializing database: {e}")
+
+
+@app.cli.command()
+def test_llm():
+    """Test LLM connection"""
+    print("Testing LLM connection...")
+    try:
+        if llm_handler.is_api_available():
+            print("✅ LLM API is available")
+            
+            # Test with simple message
+            test_response = llm_handler.get_response([
+                {'role': 'system', 'content': 'You are a helpful assistant.'},
+                {'role': 'user', 'content': 'Say hello briefly.'}
+            ], 'en')
+            
+            print(f"✅ Test response: {test_response}")
+        else:
+            print("⚠️  LLM API key not found")
+            print("Using fallback mode")
+    except Exception as e:
+        print(f"❌ Error testing LLM: {e}")
+
+
+@app.cli.command()
+def test_language_detection():
+    """Test language detection"""
+    print("Testing language detection...")
+    
+    test_messages = [
+        "Hello, how are you?",
+        "Hola, ¿cómo estás?",
+        "Bonjour, comment allez-vous?",
+        "Olá, como você está?"
+    ]
+    
+    for msg in test_messages:
+        lang = language_detector.detect(msg)
+        confidence = language_detector.detect_confidence(msg)
+        print(f"  '{msg}' → {lang} (confidence: {confidence:.2%})")
+
+
+@app.cli.command()
+def show_stats():
+    """Show database statistics"""
+    try:
+        stats = db.get_statistics()
+        print("\n📊 Chat Statistics:")
+        print(f"  Total Conversations: {stats.get('total_conversations', 0)}")
+        print(f"  Total Messages: {stats.get('total_messages', 0)}")
+        print(f"  Languages Used: {', '.join(stats.get('languages_used', []))}")
+    except Exception as e:
+        print(f"❌ Error fetching statistics: {e}")
+
+
+# ==================== Main ====================
 
 if __name__ == '__main__':
-    app.run(
-        host='0.0.0.0',
-        port=int(os.getenv('PORT', 5000)),
-        debug=app.config['DEBUG']
-    )
+    # Determine host and port from environment or defaults
+    host = os.getenv('FLASK_HOST', '127.0.0.1')
+    port = int(os.getenv('FLASK_PORT', 5000))
+    debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    
+    print(f"""
+    ╔══════════════════════════════════════╗
+    ║   🤖 FALIZ CHAT BOT - Starting      ║
+    ║      Multilingual AI Assistant      ║
+    ╚══════════════════════════════════════╝
+    
+    🌐 Server: {host}:{port}
+    🔍 Debug Mode: {debug}
+    🗄️  Database: {app.config['DATABASE_PATH']}
+    ⚙️  LLM API: {'Available' if llm_handler.is_api_available() else 'Not configured (using fallback)'}
+    
+    Access at: http://{host}:{port}
+    Press Ctrl+C to stop
+    """)
+    
+    app.run(host=host, port=port, debug=debug)
